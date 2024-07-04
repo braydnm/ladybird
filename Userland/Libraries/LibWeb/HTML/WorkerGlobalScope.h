@@ -41,6 +41,11 @@ class WorkerGlobalScope
     JS_DECLARE_ALLOCATOR(WorkerGlobalScope);
 
 public:
+    enum WorkerType {
+        Dedicated,
+        Shared
+    };
+
     virtual ~WorkerGlobalScope() override;
 
     // ^WindowOrWorkerGlobalScopeMixin
