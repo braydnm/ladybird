@@ -272,6 +272,7 @@ set(SOURCES
 )
 
 serenity_lib(LibJS js)
+add_compile_definitions(TRACY_ENABLE)
 target_link_libraries(LibJS PRIVATE LibCore LibCrypto LibFileSystem LibThreading LibRegex LibSyntax)
 
 # Link LibUnicode publicly to ensure ICU data (which is in libicudata.a) is available in any process using LibJS.

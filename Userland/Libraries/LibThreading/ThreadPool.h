@@ -91,6 +91,30 @@ public:
         initialize_workers(concurrency.value_or(Core::System::hardware_concurrency()));
     }
 
+    template<typename... Args>
+    ThreadPool(Args&&... args)
+        : m_handler([](Function<void(Work)>, Work) {})
+        , m_work_available(m_mutex)
+        , m_work_done(m_mutex)
+    {
+        for (size_t i = 0; i < Core::System::hardware_concurrency(); ++i) {
+            m_workers.append(Thread::construct([this, &args...]() -> intptr_t {
+                Looper<ThreadPool> thread_looper(args...);
+                for (; !m_should_exit;) {
+                    auto result = thread_looper.next(*this, true);
+                    if (result == IterationDecision::Break)
+                        break;
+                }
+
+                return 0;
+            },
+                "ThreadPool worker"sv));
+        }
+
+        for (auto& worker : m_workers)
+            worker->start();
+    }
+
     ~ThreadPool()
     {
         m_should_exit.store(true, AK::MemoryOrder::memory_order_release);

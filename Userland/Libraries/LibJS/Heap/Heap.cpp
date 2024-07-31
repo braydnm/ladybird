@@ -5,6 +5,12 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include "AK/Assertions.h"
+#include "AK/NonnullRefPtr.h"
+#include "LibJS/Heap/Cell.h"
+#include "LibJS/Heap/GCPtr.h"
+#include "LibThreading/ThreadPool.h"
+#include "tracy-0.11.0/public/tracy/Tracy.hpp"
 #include <AK/Badge.h>
 #include <AK/Debug.h>
 #include <AK/HashTable.h>
@@ -34,6 +40,177 @@ namespace JS {
 // NOTE: We keep a per-thread list of custom ranges. This hinges on the assumption that there is one JS VM per thread.
 static __thread HashMap<FlatPtr*, size_t>* s_custom_ranges_for_conservative_scan = nullptr;
 static __thread HashMap<FlatPtr*, SourceLocation*>* s_safe_function_locations = nullptr;
+
+static void add_possible_value(HashMap<FlatPtr, HeapRoot>& possible_pointers, FlatPtr data, HeapRoot origin, FlatPtr min_block_address, FlatPtr max_block_address)
+{
+    if constexpr (sizeof(FlatPtr*) == sizeof(Value)) {
+        // Because Value stores pointers in non-canonical form we have to check if the top bytes
+        // match any pointer-backed tag, in that case we have to extract the pointer to its
+        // canonical form and add that as a possible pointer.
+        FlatPtr possible_pointer;
+        if ((data & SHIFTED_IS_CELL_PATTERN) == SHIFTED_IS_CELL_PATTERN)
+            possible_pointer = Value::extract_pointer_bits(data);
+        else
+            possible_pointer = data;
+        if (possible_pointer < min_block_address || possible_pointer > max_block_address)
+            return;
+        possible_pointers.set(possible_pointer, move(origin));
+    } else {
+        static_assert((sizeof(Value) % sizeof(FlatPtr*)) == 0);
+        if (data < min_block_address || data > max_block_address)
+            return;
+        // In the 32-bit case we will look at the top and bottom part of Value separately we just
+        // add both the upper and lower bytes as possible pointers.
+        possible_pointers.set(data, move(origin));
+    }
+}
+
+template<typename Callback>
+static void for_each_cell_among_possible_pointers(HashTable<HeapBlock*> const& all_live_heap_blocks, HashMap<FlatPtr, HeapRoot>& possible_pointers, Callback callback)
+{
+    for (auto possible_pointer : possible_pointers.keys()) {
+        if (!possible_pointer)
+            continue;
+        auto* possible_heap_block = HeapBlock::from_cell(reinterpret_cast<Cell const*>(possible_pointer));
+        if (!all_live_heap_blocks.contains(possible_heap_block))
+            continue;
+        if (auto* cell = possible_heap_block->cell_from_possible_pointer(possible_pointer)) {
+            callback(cell, possible_pointer);
+        }
+    }
+}
+
+static constexpr size_t WORK_STEALING_SHARE_INTERVAL_DEFAULT = 128;
+static constexpr size_t WORK_STEALING_GLOBAL_DONATE_RATIO_DEFAULT = 2;
+static constexpr size_t WORK_STEALING_MIN_NUMBER_OF_LOCAL_JOBS_DEFAULT = 4;
+
+template<size_t SHARE_INTERVAL = WORK_STEALING_SHARE_INTERVAL_DEFAULT,
+    size_t GLOBAL_DONATE_RATIO = WORK_STEALING_GLOBAL_DONATE_RATIO_DEFAULT,
+    size_t MIN_NUMBER_OF_LOCAL_JOBS = WORK_STEALING_MIN_NUMBER_OF_LOCAL_JOBS_DEFAULT>
+struct MarkingVisitor {
+
+    template<typename Pool>
+    class Looper final : public Cell::Visitor {
+    public:
+        Looper(HashTable<HeapBlock*> const& all_live_block, FlatPtr min_block_address, FlatPtr max_block_address)
+            : m_all_live_heap_blocks(all_live_block)
+            , m_min_block_address(min_block_address)
+            , m_max_block_address(max_block_address)
+        {
+        }
+
+        AK::IterationDecision next(Pool& pool, bool wait)
+        {
+            // The only time a work-stealing looper should yield to the main thread
+            // loop is if there is no local jobs (generally this should also be
+            // after an attempt to replenish the local queue with jobs from the
+            // global queue)
+            VERIFY(m_local_queue.is_empty());
+            while (true) {
+                if (do_work(pool)) {
+                    return IterationDecision::Continue;
+                }
+                
+                if (pool.looper_should_exit())
+                    return IterationDecision::Break;
+
+                {
+                    ZoneScopedN("work-stealing wait");
+                    if (!wait)
+                        return IterationDecision::Continue;
+
+                    pool.looper_wait();
+                }
+            }
+        }
+
+        virtual void visit_impl(Cell& cell) override
+        {
+            ZoneScopedN("MarkingVisitor - visit");
+            if (cell.is_marked())
+                return;
+            dbgln_if(HEAP_DEBUG, "  ! {}", &cell);
+
+            cell.set_marked(true);
+            m_local_queue.enqueue(cell);
+        }
+
+        virtual void visit_possible_values(ReadonlyBytes bytes) override
+        {
+            ZoneScopedN("MarkingVisitor - possible value");
+            HashMap<FlatPtr, HeapRoot> possible_pointers;
+
+            auto* raw_pointer_sized_values = reinterpret_cast<FlatPtr const*>(bytes.data());
+            for (size_t i = 0; i < (bytes.size() / sizeof(FlatPtr)); ++i)
+                add_possible_value(possible_pointers, raw_pointer_sized_values[i], HeapRoot { .type = HeapRoot::Type::HeapFunctionCapturedPointer }, m_min_block_address, m_max_block_address);
+
+            for_each_cell_among_possible_pointers(m_all_live_heap_blocks, possible_pointers, [&](Cell* cell, FlatPtr) {
+                if (cell->is_marked())
+                    return;
+                if (cell->state() != Cell::State::Live)
+                    return;
+                cell->set_marked(true);
+                m_local_queue.enqueue(*cell);
+            });
+        }
+
+    private:
+        bool do_work(Pool& pool)
+        {
+            ZoneScopedN("work-stealing perform work");
+            auto guard = pool.looper_enter_busy_section();
+            // Attempt to replenish the local queue with 1/Nth of the global
+            // queue if this worker has no work or exit if requested
+            if (m_local_queue.is_empty()) {
+                ZoneScopedN("work-stealing replenish");
+                pool.looper_with_global_queue([this, num_workers = pool.looper_num_workers()](auto& queue) {
+                    size_t num_jobs = max(1, queue.size() / num_workers);
+                    for (size_t i = 0; i < num_jobs && !queue.is_empty(); ++i) {
+                        m_local_queue.enqueue(queue.dequeue());
+                    }
+                });
+            }
+
+            // if there are still no jobs even after checking the global queue yield
+            if (m_local_queue.is_empty()) {
+                return false;
+            }
+
+            // Run handler on jobs in the local queue
+            while (!m_local_queue.is_empty()) {
+                ZoneScopedN("work-stealing local work");
+                for (size_t i = 0; i < SHARE_INTERVAL && !m_local_queue.is_empty(); ++i) {
+                    {
+                        ZoneScopedN("work-stealing handler runner");
+                        auto root = m_local_queue.dequeue();
+                        root->visit_edges(*this);
+                    }
+                }
+                // Share jobs with the global queue if criteria is met
+                if (m_local_queue.size() >= MIN_NUMBER_OF_LOCAL_JOBS) {
+                    ZoneScopedN("work-stealing replenish");
+                    pool.looper_try_with_global_queue([this, &pool](auto& queue) {
+                        if (!queue.is_empty()) {
+                            return;
+                        }
+
+                        for (size_t i = 0; i < m_local_queue.size() / GLOBAL_DONATE_RATIO; ++i) {
+                            queue.enqueue(m_local_queue.dequeue());
+                        }
+                        pool.looper_signal_work_available();
+                    });
+                }
+            }
+
+            return true;
+        }
+
+        Queue<NonnullGCPtr<Cell>> m_local_queue;
+        HashTable<HeapBlock*> const& m_all_live_heap_blocks;
+        FlatPtr const m_min_block_address;
+        FlatPtr const m_max_block_address;
+    };
+};
 
 Heap::Heap(VM& vm)
     : HeapBase(vm)
@@ -68,30 +245,6 @@ void Heap::will_allocate(size_t size)
     m_allocated_bytes_since_last_gc += size;
 }
 
-static void add_possible_value(HashMap<FlatPtr, HeapRoot>& possible_pointers, FlatPtr data, HeapRoot origin, FlatPtr min_block_address, FlatPtr max_block_address)
-{
-    if constexpr (sizeof(FlatPtr*) == sizeof(Value)) {
-        // Because Value stores pointers in non-canonical form we have to check if the top bytes
-        // match any pointer-backed tag, in that case we have to extract the pointer to its
-        // canonical form and add that as a possible pointer.
-        FlatPtr possible_pointer;
-        if ((data & SHIFTED_IS_CELL_PATTERN) == SHIFTED_IS_CELL_PATTERN)
-            possible_pointer = Value::extract_pointer_bits(data);
-        else
-            possible_pointer = data;
-        if (possible_pointer < min_block_address || possible_pointer > max_block_address)
-            return;
-        possible_pointers.set(possible_pointer, move(origin));
-    } else {
-        static_assert((sizeof(Value) % sizeof(FlatPtr*)) == 0);
-        if (data < min_block_address || data > max_block_address)
-            return;
-        // In the 32-bit case we will look at the top and bottom part of Value separately we just
-        // add both the upper and lower bytes as possible pointers.
-        possible_pointers.set(data, move(origin));
-    }
-}
-
 void Heap::find_min_and_max_block_addresses(FlatPtr& min_address, FlatPtr& max_address)
 {
     min_address = explode_byte(0xff);
@@ -99,21 +252,6 @@ void Heap::find_min_and_max_block_addresses(FlatPtr& min_address, FlatPtr& max_a
     for (auto& allocator : m_all_cell_allocators) {
         min_address = min(min_address, allocator.min_block_address());
         max_address = max(max_address, allocator.max_block_address() + HeapBlockBase::block_size);
-    }
-}
-
-template<typename Callback>
-static void for_each_cell_among_possible_pointers(HashTable<HeapBlock*> const& all_live_heap_blocks, HashMap<FlatPtr, HeapRoot>& possible_pointers, Callback callback)
-{
-    for (auto possible_pointer : possible_pointers.keys()) {
-        if (!possible_pointer)
-            continue;
-        auto* possible_heap_block = HeapBlock::from_cell(reinterpret_cast<Cell const*>(possible_pointer));
-        if (!all_live_heap_blocks.contains(possible_heap_block))
-            continue;
-        if (auto* cell = possible_heap_block->cell_from_possible_pointer(possible_pointer)) {
-            callback(cell, possible_pointer);
-        }
     }
 }
 
@@ -370,54 +508,9 @@ NO_SANITIZE_ADDRESS void Heap::gather_conservative_roots(HashMap<Cell*, HeapRoot
     });
 }
 
-class MarkingVisitor final : public Cell::Visitor {
-public:
-    explicit MarkingVisitor(NonnullGCPtr<Cell>& root, Function<void(NonnullGCPtr<Cell>)> const& submit, HashTable<HeapBlock*> const& all_live_block, FlatPtr min_block_address, FlatPtr max_block_address)
-        : m_submit(submit)
-        , m_all_live_heap_blocks(all_live_block)
-        , m_min_block_address(min_block_address)
-        , m_max_block_address(max_block_address)
-    {
-        root->visit_edges(*this);
-    }
-
-    virtual void visit_impl(Cell& cell) override
-    {
-        if (cell.is_marked())
-            return;
-        dbgln_if(HEAP_DEBUG, "  ! {}", &cell);
-
-        cell.set_marked(true);
-        m_submit(cell);
-    }
-
-    virtual void visit_possible_values(ReadonlyBytes bytes) override
-    {
-        HashMap<FlatPtr, HeapRoot> possible_pointers;
-
-        auto* raw_pointer_sized_values = reinterpret_cast<FlatPtr const*>(bytes.data());
-        for (size_t i = 0; i < (bytes.size() / sizeof(FlatPtr)); ++i)
-            add_possible_value(possible_pointers, raw_pointer_sized_values[i], HeapRoot { .type = HeapRoot::Type::HeapFunctionCapturedPointer }, m_min_block_address, m_max_block_address);
-
-        for_each_cell_among_possible_pointers(m_all_live_heap_blocks, possible_pointers, [&](Cell* cell, FlatPtr) {
-            if (cell->is_marked())
-                return;
-            if (cell->state() != Cell::State::Live)
-                return;
-            cell->set_marked(true);
-            m_submit(*cell);
-        });
-    }
-
-private:
-    Function<void(NonnullGCPtr<Cell>)> const& m_submit;
-    HashTable<HeapBlock*> const& m_all_live_heap_blocks;
-    FlatPtr const m_min_block_address;
-    FlatPtr const m_max_block_address;
-};
-
 void Heap::mark_live_cells(HashMap<Cell*, HeapRoot> const& roots)
 {
+    ZoneScopedN("marking_heap_cells");
     dbgln_if(HEAP_DEBUG, "mark_live_cells:");
 
     HashTable<HeapBlock*> all_live_block;
@@ -430,20 +523,20 @@ void Heap::mark_live_cells(HashMap<Cell*, HeapRoot> const& roots)
         return IterationDecision::Continue;
     });
 
-    auto marking_threads = Threading::WorkStealingThreadPool<NonnullGCPtr<Cell>> {
-        [&all_live_block = static_cast<HashTable<HeapBlock*> const&>(all_live_block),
-            min_block_address,
-            max_block_address](Function<void(NonnullGCPtr<Cell>)> submit, NonnullGCPtr<Cell> root) {
-            MarkingVisitor visitor(root, submit, all_live_block, min_block_address, max_block_address);
-        }
-    };
+    Threading::ThreadPool<NonnullGCPtr<Cell>, MarkingVisitor<>::Looper> marking_threads(all_live_block, min_block_address, max_block_address);
 
-    for (auto* root : roots.keys()) {
-        root->set_marked(true);
-        marking_threads.submit(*root);
+    {
+        ZoneScopedN("Submitting roots");
+        for (auto* root : roots.keys()) {
+            root->set_marked(true);
+            marking_threads.submit(*root);
+        }
     }
 
-    marking_threads.wait_for_all();
+    {
+        ZoneScopedN("Wait");
+        marking_threads.wait_for_all();
+    }
 
     for (auto& inverse_root : m_uprooted_cells)
         inverse_root->set_marked(false);

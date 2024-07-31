@@ -9,6 +9,9 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <LibThreading/public/tracy//Tracy.hpp>
+#include <LibThreading/public/common/TracyAlloc.hpp>
+
 namespace Threading {
 
 Thread::Thread(Function<intptr_t()> action, StringView thread_name)

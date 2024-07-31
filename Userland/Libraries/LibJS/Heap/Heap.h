@@ -89,7 +89,7 @@ public:
     void uproot_cell(Cell* cell);
 
 private:
-    friend class MarkingVisitor;
+    // friend class MarkingVisitor;
     friend class GraphConstructorVisitor;
     friend class DeferGC;
 

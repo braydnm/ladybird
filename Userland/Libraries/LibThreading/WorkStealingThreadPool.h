@@ -6,8 +6,15 @@
 
 #pragma once
 
+#include "tracy-0.11.0/public/tracy/Tracy.hpp"
 #include <AK/IterationDecision.h>
 #include <LibThreading/ThreadPool.h>
+
+#include <LibThreading/public/tracy/Tracy.hpp>
+
+#ifndef TRACY_ENABLE
+#error "WTF"
+#endif
 
 namespace Threading {
 /**
@@ -58,24 +65,29 @@ struct WorkStealingLooper {
                 if (do_work(pool)) {
                     return IterationDecision::Continue;
                 }
-
+                
                 if (pool.looper_should_exit())
                     return IterationDecision::Break;
 
-                if (!wait)
-                    return IterationDecision::Continue;
+                {
+                    ZoneScopedN("work-stealing wait");
+                    if (!wait)
+                        return IterationDecision::Continue;
 
-                pool.looper_wait();
+                    pool.looper_wait();
+                }
             }
         }
 
     private:
         bool do_work(Pool& pool)
         {
+            ZoneScopedN("work-stealing perform work");
             auto guard = pool.looper_enter_busy_section();
             // Attempt to replenish the local queue with 1/Nth of the global
             // queue if this worker has no work or exit if requested
             if (m_local_queue.is_empty()) {
+                ZoneScopedN("work-stealing replenish");
                 pool.looper_with_global_queue([this, num_workers = pool.looper_num_workers()](auto& queue) {
                     size_t num_jobs = max(1, queue.size() / num_workers);
                     for (size_t i = 0; i < num_jobs && !queue.is_empty(); ++i) {
@@ -91,11 +103,16 @@ struct WorkStealingLooper {
 
             // Run handler on jobs in the local queue
             while (!m_local_queue.is_empty()) {
-                pool.looper_run_handler([this](typename Pool::Work w) { m_local_queue.enqueue(w); }, m_local_queue.dequeue());
+                ZoneScopedN("work-stealing local work");
+                {
+                    ZoneScopedN("work-stealing handler runner");
+                    pool.looper_run_handler([this](typename Pool::Work w) { m_local_queue.enqueue(w); }, m_local_queue.dequeue());
+                }
                 ++m_jobs_since_last_share;
                 ++m_jobs_ran;
                 // Share jobs with the global queue if criteria is met
                 if (m_jobs_since_last_share >= SHARE_INTERVAL && m_local_queue.size() >= MIN_NUMBER_OF_LOCAL_JOBS) {
+                    ZoneScopedN("work-stealing replenish");
                     m_jobs_since_last_share = 0;
                     pool.looper_try_with_global_queue([this, &pool](auto& queue) {
                         if (!queue.is_empty()) {

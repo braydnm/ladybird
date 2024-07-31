@@ -27,6 +27,7 @@
 
 #pragma once
 
+#include "tracy-0.11.0/public/tracy/Tracy.hpp"
 #include <AK/Assertions.h>
 #include <AK/Atomic.h>
 #include <AK/BitCast.h>
@@ -35,6 +36,8 @@
 #include <AK/Span.h>
 #include <AK/StdLibExtras.h>
 #include <AK/Types.h>
+
+#include <LibThreading/public/tracy/Tracy.hpp>
 
 namespace AK {
 
@@ -110,14 +113,19 @@ public:
     // Note: Despite this method being const, a mutable lambda _may_ modify its own captures.
     Out operator()(In... in) const
     {
-        auto* wrapper = callable_wrapper();
-        VERIFY(wrapper);
-        ++m_call_nesting_level;
-        ScopeGuard guard([this] {
-            if (--m_call_nesting_level == 0 && m_deferred_clear)
-                const_cast<Function*>(this)->clear(false);
-        });
-        return wrapper->call(forward<In>(in)...);
+        ZoneScopedN("Function call");
+        CallableWrapperBase* wrapper;
+        {
+            ZoneScopedN("Function wrapper prepare");
+            wrapper = callable_wrapper();
+            VERIFY(wrapper);
+            ++m_call_nesting_level;
+            ScopeGuard guard([this] {
+                if (--m_call_nesting_level == 0 && m_deferred_clear)
+                    const_cast<Function*>(this)->clear(false);
+            }); 
+        }
+       return wrapper->call(forward<In>(in)...);
     }
 
     explicit operator bool() const { return !!callable_wrapper(); }
